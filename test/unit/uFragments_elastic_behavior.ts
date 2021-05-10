@@ -5,40 +5,77 @@ import { expect } from 'chai'
 
 const DECIMALS = 9
 const INITIAL_SUPPLY = ethers.utils.parseUnits('50', 6 + DECIMALS)
+// 2:1 exchange rate
+const INITIAL_EXCHANGE_RATE = ethers.BigNumber.from(10).pow(8).mul(2)
 const MAX_UINT256 = ethers.BigNumber.from(2).pow(256).sub(1)
 const MAX_INT256 = ethers.BigNumber.from(2).pow(255).sub(1)
-const TOTAL_GONS = MAX_UINT256.sub(MAX_UINT256.mod(INITIAL_SUPPLY))
+const TOTAL_COLLATERAL = INITIAL_SUPPLY.div(2)
 
 const toUFrgDenomination = (ample: string): BigNumber =>
   ethers.utils.parseUnits(ample, DECIMALS)
 
 const unitTokenAmount = toUFrgDenomination('1')
 
-let token: Contract, owner: Signer, anotherAccount: Signer, recipient: Signer
+let token: Contract,
+  owner: Signer,
+  anotherAccount: Signer,
+  recipient: Signer,
+  mockCollateralToken: Contract
 
 async function upgradeableToken() {
   const [owner, recipient, anotherAccount] = await ethers.getSigners()
+
+  const mockCollateralToken = await (
+    await ethers.getContractFactory('MockERC20Token')
+  )
+    .connect(owner)
+    .deploy()
+  const mockMarketOracle = await (await ethers.getContractFactory('MockOracle'))
+    .connect(owner)
+    .deploy('MarketOracle')
+  await mockMarketOracle.storeData(INITIAL_EXCHANGE_RATE)
+
   const factory = await ethers.getContractFactory('UFragments')
   const token = await upgrades.deployProxy(
     factory.connect(owner),
-    [await owner.getAddress()],
+    [await owner.getAddress(), mockCollateralToken.address, 18],
     {
-      initializer: 'initialize(address)',
+      initializer: 'initialize(address, address, uint256)',
     },
   )
-  return { token, owner, recipient, anotherAccount }
+
+  // setup oracles
+  await token.connect(owner).setMarketOracle(mockMarketOracle.address)
+
+  await mockCollateralToken.mint(await owner.getAddress(), TOTAL_COLLATERAL)
+  await mockCollateralToken
+    .connect(owner)
+    .approve(token.address, TOTAL_COLLATERAL)
+  await token.connect(owner).mint(await owner.getAddress(), TOTAL_COLLATERAL)
+  await token.connect(owner).rebase()
+  return { token, owner, recipient, anotherAccount, mockCollateralToken }
 }
 
 describe('UFragments:Elastic', () => {
   beforeEach('setup UFragments contract', async function () {
-    ;({ token, owner, recipient, anotherAccount } = await waffle.loadFixture(
-      upgradeableToken,
-    ))
+    ;({
+      token,
+      owner,
+      recipient,
+      anotherAccount,
+      mockCollateralToken,
+    } = await waffle.loadFixture(upgradeableToken))
   })
 
   describe('scaledTotalSupply', function () {
     it('returns the scaled total amount of tokens', async function () {
-      expect(await token.scaledTotalSupply()).to.eq(TOTAL_GONS)
+      expect(await token.scaledTotalSupply()).to.eq(TOTAL_COLLATERAL)
+    })
+  })
+
+  describe('totalSupply', function () {
+    it('returns the total amount of tokens', async function () {
+      expect(await token.totalSupply()).to.eq(INITIAL_SUPPLY)
     })
   })
 
@@ -54,7 +91,25 @@ describe('UFragments:Elastic', () => {
     describe('when the requested account has some tokens', function () {
       it('returns the total amount of tokens', async function () {
         expect(await token.scaledBalanceOf(await owner.getAddress())).to.eq(
-          TOTAL_GONS,
+          TOTAL_COLLATERAL,
+        )
+      })
+    })
+  })
+
+  describe('balanceOf', function () {
+    describe('when the requested account has no tokens', function () {
+      it('returns zero', async function () {
+        expect(await token.balanceOf(await anotherAccount.getAddress())).to.eq(
+          0,
+        )
+      })
+    })
+
+    describe('when the requested account has some tokens', function () {
+      it('returns the total amount of tokens', async function () {
+        expect(await token.balanceOf(await owner.getAddress())).to.eq(
+          INITIAL_SUPPLY,
         )
       })
     })
@@ -63,9 +118,13 @@ describe('UFragments:Elastic', () => {
 
 describe('UFragments:Elastic:transferAll', () => {
   beforeEach('setup UFragments contract', async function () {
-    ;({ token, owner, recipient, anotherAccount } = await waffle.loadFixture(
-      upgradeableToken,
-    ))
+    ;({
+      token,
+      owner,
+      recipient,
+      anotherAccount,
+      mockCollateralToken,
+    } = await waffle.loadFixture(upgradeableToken))
   })
 
   describe('when the recipient is the zero address', function () {
@@ -122,9 +181,13 @@ describe('UFragments:Elastic:transferAll', () => {
 
 describe('UFragments:Elastic:transferAllFrom', () => {
   beforeEach('setup UFragments contract', async function () {
-    ;({ token, owner, recipient, anotherAccount } = await waffle.loadFixture(
-      upgradeableToken,
-    ))
+    ;({
+      token,
+      owner,
+      recipient,
+      anotherAccount,
+      mockCollateralToken,
+    } = await waffle.loadFixture(upgradeableToken))
   })
 
   describe('when the recipient is the zero address', function () {

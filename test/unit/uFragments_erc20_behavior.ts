@@ -31,40 +31,75 @@ const toUFrgDenomination = (ample: string): BigNumber =>
   ethers.utils.parseUnits(ample, DECIMALS)
 
 const DECIMALS = 9
-const INITIAL_SUPPLY = ethers.utils.parseUnits('50', 6 + DECIMALS)
+const INITIAL_SUPPLY = ethers.BigNumber.from(0)
+const FIRST_MINT_SUPPLY = ethers.utils.parseUnits('50', 6 + DECIMALS)
 const transferAmount = toUFrgDenomination('10')
 const unitTokenAmount = toUFrgDenomination('1')
-const overdraftAmount = INITIAL_SUPPLY.add(unitTokenAmount)
+const overdraftAmount = FIRST_MINT_SUPPLY.add(unitTokenAmount)
 const overdraftAmountPlusOne = overdraftAmount.add(unitTokenAmount)
 const overdraftAmountMinusOne = overdraftAmount.sub(unitTokenAmount)
 const transferAmountPlusOne = transferAmount.add(unitTokenAmount)
 const transferAmountMinusOne = transferAmount.sub(unitTokenAmount)
 
-let token: Contract, owner: Signer, anotherAccount: Signer, recipient: Signer
+let token: Contract,
+  owner: Signer,
+  anotherAccount: Signer,
+  recipient: Signer,
+  mockCollateralToken: Contract
 
 async function upgradeableToken() {
   const [owner, recipient, anotherAccount] = await ethers.getSigners()
+
+  const mockCollateralToken = await (
+    await ethers.getContractFactory('MockERC20Token')
+  )
+    .connect(owner)
+    .deploy()
+  const mockMarketOracle = await (await ethers.getContractFactory('MockOracle'))
+    .connect(owner)
+    .deploy('MarketOracle')
+  await mockMarketOracle.storeData(ethers.BigNumber.from(10).pow(8))
+
   const factory = await ethers.getContractFactory('UFragments')
   const token = await upgrades.deployProxy(
     factory.connect(owner),
-    [await owner.getAddress()],
+    [await owner.getAddress(), mockCollateralToken.address, 18],
     {
-      initializer: 'initialize(address)',
+      initializer: 'initialize(address, address, uint256)',
     },
   )
-  return { token, owner, recipient, anotherAccount }
+
+  // setup oracles
+  await token.connect(owner).setMarketOracle(mockMarketOracle.address)
+  return { token, owner, recipient, anotherAccount, mockCollateralToken }
+}
+
+async function mintFragments(amount: BigNumber, account: Signer) {
+  await mockCollateralToken.mint(await account.getAddress(), amount)
+  await mockCollateralToken.connect(account).approve(token.address, amount)
+  await token.connect(account).mint(await account.getAddress(), amount)
 }
 
 describe('UFragments:ERC20', () => {
   before('setup UFragments contract', async function () {
-    ;({ token, owner, recipient, anotherAccount } = await waffle.loadFixture(
-      upgradeableToken,
-    ))
+    ;({
+      token,
+      owner,
+      recipient,
+      anotherAccount,
+      mockCollateralToken,
+    } = await waffle.loadFixture(upgradeableToken))
   })
 
   describe('totalSupply', function () {
-    it('returns the total amount of tokens', async function () {
+    it('returns 0 tokens to start', async function () {
       expect(await token.totalSupply()).to.eq(INITIAL_SUPPLY)
+    })
+
+    it('returns the proper total supply', async function () {
+      const amount = FIRST_MINT_SUPPLY
+      await mintFragments(amount, recipient)
+      expect(await token.totalSupply()).to.eq(amount)
     })
   })
 
@@ -79,9 +114,9 @@ describe('UFragments:ERC20', () => {
 
     describe('when the requested account has some tokens', function () {
       it('returns the total amount of tokens', async function () {
-        expect(await token.balanceOf(await owner.getAddress())).to.eq(
-          INITIAL_SUPPLY,
-        )
+        const amount = FIRST_MINT_SUPPLY
+        await mintFragments(amount, owner)
+        expect(await token.balanceOf(await owner.getAddress())).to.eq(amount)
       })
     })
   })
@@ -89,9 +124,15 @@ describe('UFragments:ERC20', () => {
 
 describe('UFragments:ERC20:transfer', () => {
   before('setup UFragments contract', async function () {
-    ;({ token, owner, recipient, anotherAccount } = await waffle.loadFixture(
-      upgradeableToken,
-    ))
+    ;({
+      token,
+      owner,
+      recipient,
+      anotherAccount,
+      mockCollateralToken,
+    } = await waffle.loadFixture(upgradeableToken))
+    const amount = FIRST_MINT_SUPPLY
+    await mintFragments(amount, owner)
   })
 
   describe('when the sender does NOT have enough balance', function () {
@@ -146,6 +187,8 @@ describe('UFragments:ERC20:transferFrom', () => {
     ;({ token, owner, recipient, anotherAccount } = await waffle.loadFixture(
       upgradeableToken,
     ))
+    const amount = FIRST_MINT_SUPPLY
+    await mintFragments(amount, owner)
   })
 
   describe('when the spender does NOT have enough approved balance', function () {

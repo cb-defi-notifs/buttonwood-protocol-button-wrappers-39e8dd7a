@@ -15,6 +15,10 @@ import { BigNumber, BigNumberish, Contract, Signer } from 'ethers'
 import { imul } from '../utils/utils'
 const Stochasm = require('stochasm')
 
+const INITIAL_EXCHANGE_RATE = ethers.BigNumber.from(10).pow(8)
+const DECIMALS = 18
+const FIRST_MINT_SUPPLY = ethers.utils.parseUnits('50', 6 + DECIMALS)
+
 const endSupply = ethers.BigNumber.from(2).pow(128).sub(1)
 const uFragmentsGrowth = new Stochasm({
   min: -0.5,
@@ -26,7 +30,8 @@ let uFragments: Contract,
   inflation: BigNumber,
   rebaseAmt = ethers.BigNumber.from(0),
   preRebaseSupply = ethers.BigNumber.from(0),
-  postRebaseSupply = ethers.BigNumber.from(0)
+  postRebaseSupply = ethers.BigNumber.from(0),
+  exchangeRate = INITIAL_EXCHANGE_RATE
 
 async function checkBalancesAfterOperation(
   users: Signer[],
@@ -69,19 +74,36 @@ async function checkBalancesAfterTransfer(users: Signer[], tAmt: BigNumberish) {
 async function exec() {
   const [deployer, user] = await ethers.getSigners()
   const factory = await ethers.getContractFactory('UFragments')
+  const mockCollateralToken = await (
+    await ethers.getContractFactory('MockERC20Token')
+  )
+    .connect(deployer)
+    .deploy()
+  const mockMarketOracle = await (await ethers.getContractFactory('MockOracle'))
+    .connect(deployer)
+    .deploy('MarketOracle')
+  await mockMarketOracle.storeData(INITIAL_EXCHANGE_RATE)
+
   uFragments = await upgrades.deployProxy(
-    factory.connect(deployer),
-    [await deployer.getAddress()],
+    factory,
+    [await deployer.getAddress(), mockCollateralToken.address, 18],
     {
-      initializer: 'initialize(address)',
+      initializer: 'initialize(address, address, uint256)',
     },
   )
-  await uFragments.connect(deployer).setMonetaryPolicy(deployer.getAddress())
+  await uFragments.connect(deployer).setMarketOracle(mockMarketOracle.address)
+
+  await mockCollateralToken.mint(await deployer.getAddress(), FIRST_MINT_SUPPLY)
+  await mockCollateralToken
+    .connect(deployer)
+    .approve(uFragments.address, FIRST_MINT_SUPPLY)
+  await uFragments.mint(await deployer.getAddress(), FIRST_MINT_SUPPLY)
 
   let i = 0
   do {
     preRebaseSupply = await uFragments.totalSupply()
-    await uFragments.connect(deployer).rebase(preRebaseSupply.add(rebaseAmt))
+    await mockMarketOracle.storeData(exchangeRate)
+    await uFragments.connect(deployer).rebase()
     postRebaseSupply = await uFragments.totalSupply()
     i++
 
@@ -101,6 +123,7 @@ async function exec() {
     preRebaseSupply = await uFragments.totalSupply()
     inflation = uFragmentsGrowth.next().toFixed(5)
     rebaseAmt = imul(preRebaseSupply, inflation, 1)
+    exchangeRate = imul(exchangeRate, inflation, 1)
   } while ((await uFragments.totalSupply()).add(rebaseAmt).lt(endSupply))
 }
 

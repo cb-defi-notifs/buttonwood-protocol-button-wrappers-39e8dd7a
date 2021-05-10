@@ -1,39 +1,86 @@
-import { ethers, upgrades } from 'hardhat'
+import { ethers, upgrades, waffle } from 'hardhat'
 import { Contract, Signer, BigNumber } from 'ethers'
 import { expect } from 'chai'
+import { imul } from '../utils/utils'
 
 const toUFrgDenomination = (ample: string): BigNumber =>
   ethers.utils.parseUnits(ample, DECIMALS)
 
-const DECIMALS = 9
-const INITIAL_SUPPLY = ethers.utils.parseUnits('50', 6 + DECIMALS)
+const DECIMALS = 18
+const INITIAL_SUPPLY = ethers.BigNumber.from(0)
+const FIRST_MINT_SUPPLY = ethers.utils.parseUnits('50', 6 + DECIMALS)
+const INITIAL_EXCHANGE_RATE = ethers.BigNumber.from(10).pow(8)
 const MAX_UINT256 = ethers.BigNumber.from(2).pow(256).sub(1)
 const MAX_INT256 = ethers.BigNumber.from(2).pow(255).sub(1)
-const TOTAL_GONS = MAX_UINT256.sub(MAX_UINT256.mod(INITIAL_SUPPLY))
+const TOTAL_GONS = 0
 
 const transferAmount = toUFrgDenomination('10')
 const unitTokenAmount = toUFrgDenomination('1')
 
-let accounts: Signer[],
-  deployer: Signer,
-  uFragments: Contract,
+let deployer: Signer, accounts: Signer[]
+let uFragments: Contract,
+  mockCollateralToken: Contract,
+  mockMarketOracle: Contract,
   initialSupply: BigNumber
 
-async function setupContracts() {
+async function mockedUFragments() {
   // prepare signers
-  accounts = await ethers.getSigners()
-  deployer = accounts[0]
+  const accounts = await ethers.getSigners()
+  const deployer = accounts[0]
   // deploy upgradable token
   const factory = await ethers.getContractFactory('UFragments')
-  uFragments = await upgrades.deployProxy(
+
+  const mockCollateralToken = await (
+    await ethers.getContractFactory('MockERC20Token')
+  )
+    .connect(deployer)
+    .deploy()
+  const mockMarketOracle = await (await ethers.getContractFactory('MockOracle'))
+    .connect(deployer)
+    .deploy('MarketOracle')
+  await mockMarketOracle.storeData(INITIAL_EXCHANGE_RATE)
+
+  const uFragments = await upgrades.deployProxy(
     factory,
-    [await deployer.getAddress()],
+    [await deployer.getAddress(), mockCollateralToken.address, 18],
     {
-      initializer: 'initialize(address)',
+      initializer: 'initialize(address, address, uint256)',
     },
   )
+
+  // setup oracles
+  await uFragments.connect(deployer).setMarketOracle(mockMarketOracle.address)
+
   // fetch initial supply
-  initialSupply = await uFragments.totalSupply()
+  const initialSupply = await uFragments.totalSupply()
+
+  return {
+    deployer,
+    accounts,
+    initialSupply,
+    uFragments,
+    mockCollateralToken,
+    mockMarketOracle,
+  }
+}
+
+async function mintFragments(amount: BigNumber) {
+  await mockCollateralToken.mint(await deployer.getAddress(), amount)
+  await mockCollateralToken
+    .connect(deployer)
+    .approve(uFragments.address, amount)
+  await uFragments.mint(await deployer.getAddress(), amount)
+}
+
+async function setupContracts() {
+  ;({
+    deployer,
+    accounts,
+    uFragments,
+    mockCollateralToken,
+    initialSupply,
+    mockMarketOracle,
+  } = await waffle.loadFixture(mockedUFragments))
 }
 
 describe('UFragments', () => {
@@ -49,13 +96,7 @@ describe('UFragments', () => {
 describe('UFragments:Initialization', () => {
   before('setup UFragments contract', setupContracts)
 
-  it('should transfer 50M uFragments to the deployer', async function () {
-    expect(await uFragments.balanceOf(await deployer.getAddress())).to.eq(
-      INITIAL_SUPPLY,
-    )
-  })
-
-  it('should set the totalSupply to 50M', async function () {
+  it('should start with the totalSupply at 0', async function () {
     expect(await uFragments.totalSupply()).to.eq(INITIAL_SUPPLY)
   })
 
@@ -70,91 +111,222 @@ describe('UFragments:Initialization', () => {
   })
 })
 
-describe('UFragments:setMonetaryPolicy', async () => {
-  let policy: Signer, policyAddress: string
+describe('UFragments:setMarketOracle', async function () {
+  before('setup UFragments contract', setupContracts)
 
-  before('setup UFragments contract', async () => {
-    await setupContracts()
-    policy = accounts[1]
-    policyAddress = await policy.getAddress()
-  })
-
-  it('should set reference to policy contract', async function () {
-    await expect(uFragments.connect(deployer).setMonetaryPolicy(policyAddress))
-      .to.emit(uFragments, 'LogMonetaryPolicyUpdated')
-      .withArgs(policyAddress)
-    expect(await uFragments.monetaryPolicy()).to.eq(policyAddress)
+  it('should set marketOracle', async function () {
+    await uFragments
+      .connect(deployer)
+      .setMarketOracle(await deployer.getAddress())
+    expect(await uFragments.marketOracle()).to.eq(await deployer.getAddress())
   })
 })
 
-describe('UFragments:setMonetaryPolicy:accessControl', async () => {
-  let policy: Signer, policyAddress: string
-
-  before('setup UFragments contract', async () => {
-    await setupContracts()
-    policy = accounts[1]
-    policyAddress = await policy.getAddress()
-  })
+describe('UFragments:setMarketOracle:accessControl', function () {
+  before('setup UFragments contract', setupContracts)
 
   it('should be callable by owner', async function () {
-    await expect(uFragments.connect(deployer).setMonetaryPolicy(policyAddress))
-      .to.not.be.reverted
-  })
-})
-
-describe('UFragments:setMonetaryPolicy:accessControl', async () => {
-  let policy: Signer, policyAddress: string, user: Signer
-
-  before('setup UFragments contract', async () => {
-    await setupContracts()
-    policy = accounts[1]
-    user = accounts[2]
-    policyAddress = await policy.getAddress()
+    await expect(
+      uFragments.connect(deployer).setMarketOracle(await deployer.getAddress()),
+    ).to.not.be.reverted
   })
 
   it('should NOT be callable by non-owner', async function () {
-    await expect(uFragments.connect(user).setMonetaryPolicy(policyAddress)).to
-      .be.reverted
+    await expect(
+      uFragments
+        .connect(accounts[1])
+        .setMarketOracle(await deployer.getAddress()),
+    ).to.be.reverted
   })
 })
 
 describe('UFragments:Rebase:accessControl', async () => {
-  let user: Signer, userAddress: string
+  before('setup UFragments contract', setupContracts)
 
-  before('setup UFragments contract', async function () {
+  it('should be callable by anyone', async function () {
+    await mockMarketOracle.storeData(INITIAL_EXCHANGE_RATE)
+    const supply = await uFragments.totalSupply()
+    await expect(uFragments.connect(accounts[1]).rebase()).to.not.be.reverted
+    await expect(uFragments.connect(accounts[2]).rebase()).to.not.be.reverted
+    await expect(uFragments.connect(accounts[3]).rebase()).to.not.be.reverted
+  })
+})
+
+describe('UFragments:Rebase', async function () {
+  before('setup UFragments contract', setupContracts)
+
+  describe('when the market oracle returns invalid data', function () {
+    it('should fail', async function () {
+      await mockMarketOracle.storeValidity(false)
+      await mockMarketOracle.storeData(INITIAL_EXCHANGE_RATE)
+      await expect(uFragments.rebase()).to.be.reverted
+    })
+  })
+
+  describe('when the market oracle returns valid data', function () {
+    it('should NOT fail', async function () {
+      await mockMarketOracle.storeValidity(true)
+      await mockMarketOracle.storeData(INITIAL_EXCHANGE_RATE)
+      await expect(uFragments.rebase()).to.not.be.reverted
+    })
+  })
+})
+
+describe('UFragments:Rebase', async function () {
+  const INITIAL_RATE_30P_MORE = imul(INITIAL_EXCHANGE_RATE, '1.3', 1)
+
+  beforeEach('setup UFragments contract', async function () {
     await setupContracts()
-    user = accounts[1]
-    userAddress = await user.getAddress()
-    await uFragments.connect(deployer).setMonetaryPolicy(userAddress)
+    await mintFragments(FIRST_MINT_SUPPLY)
+    await mockMarketOracle.storeValidity(true)
+    await mockMarketOracle.storeData(INITIAL_RATE_30P_MORE)
   })
 
-  it('should be callable by monetary policy', async function () {
-    const supply = await uFragments.totalSupply()
-    await expect(uFragments.connect(user).rebase(supply.add(transferAmount))).to
-      .not.be.reverted
+  describe('rate increases', function () {
+    it('should increase supply', async function () {
+      const r = uFragments.rebase()
+      await expect(r)
+        .to.emit(uFragments, 'LogRebase')
+        .withArgs(imul(FIRST_MINT_SUPPLY, 1.3, 1))
+    })
+
+    it('should call getData from the market oracle', async function () {
+      await expect(uFragments.rebase())
+        .to.emit(mockMarketOracle, 'FunctionCalled')
+        .withArgs('MarketOracle', 'getData', uFragments.address)
+    })
+  })
+})
+
+describe('UFragments:Rebase', async function () {
+  const INITIAL_RATE_30P_LESS = imul(INITIAL_EXCHANGE_RATE, '0.7', 1)
+
+  beforeEach('setup UFragments contract', async function () {
+    await setupContracts()
+    await mintFragments(FIRST_MINT_SUPPLY)
+    await mockMarketOracle.storeValidity(true)
+    await mockMarketOracle.storeData(INITIAL_RATE_30P_LESS)
   })
 
-  it('should not be callable by others', async function () {
-    const supply = await uFragments.totalSupply()
-    await expect(
-      uFragments.connect(deployer).rebase(supply.add(transferAmount)),
-    ).to.be.reverted
+  describe('rate decreases', function () {
+    it('should decrease supply', async function () {
+      const r = uFragments.rebase()
+      await expect(r)
+        .to.emit(uFragments, 'LogRebase')
+        .withArgs(imul(FIRST_MINT_SUPPLY, 0.7, 1))
+    })
+
+    it('should call getData from the market oracle', async function () {
+      await expect(uFragments.rebase())
+        .to.emit(mockMarketOracle, 'FunctionCalled')
+        .withArgs('MarketOracle', 'getData', uFragments.address)
+    })
+  })
+})
+
+describe('UFragments:Rebase', async function () {
+  beforeEach('setup UFragments contract', async function () {
+    await setupContracts()
+    await mintFragments(FIRST_MINT_SUPPLY)
+    await mockCollateralToken.mint(uFragments.address, FIRST_MINT_SUPPLY)
+  })
+
+  describe('collateral balance increases', function () {
+    it('should increase supply', async function () {
+      const r = uFragments.rebase()
+      await expect(r)
+        .to.emit(uFragments, 'LogRebase')
+        .withArgs(imul(FIRST_MINT_SUPPLY, 2, 1))
+    })
+
+    it('should call getData from the market oracle', async function () {
+      await expect(uFragments.rebase())
+        .to.emit(mockMarketOracle, 'FunctionCalled')
+        .withArgs('MarketOracle', 'getData', uFragments.address)
+    })
+  })
+})
+
+describe('UFragments:Rebase', async function () {
+  beforeEach('setup UFragments contract', async function () {
+    await setupContracts()
+    await mintFragments(FIRST_MINT_SUPPLY)
+    await mockCollateralToken.burn(uFragments.address, FIRST_MINT_SUPPLY.div(2))
+  })
+
+  describe('collateral balance decreases', function () {
+    it('should decrease supply', async function () {
+      const r = uFragments.rebase()
+      await expect(r)
+        .to.emit(uFragments, 'LogRebase')
+        .withArgs(imul(FIRST_MINT_SUPPLY, 0.5, 1))
+    })
+
+    it('should call getData from the market oracle', async function () {
+      await expect(uFragments.rebase())
+        .to.emit(mockMarketOracle, 'FunctionCalled')
+        .withArgs('MarketOracle', 'getData', uFragments.address)
+    })
+  })
+})
+
+describe('UFragments:Rebase', async function () {
+  beforeEach('setup UFragments contract', async function () {
+    await setupContracts()
+    await mintFragments(FIRST_MINT_SUPPLY)
+  })
+
+  describe('both rate and collateral balance change', function () {
+    it('should rebase properly', async function () {
+      // test 100 random combinations of rate and balance
+      for (let i = 0; i < 100; i++) {
+        const max = 10000
+        const min = 0.0001
+        const rate = imul(
+          INITIAL_EXCHANGE_RATE,
+          Math.random() * (max - min) + min,
+          1,
+        )
+        const balance = imul(
+          FIRST_MINT_SUPPLY,
+          Math.random() * (max - min) + min,
+          1,
+        )
+        const expectedSupply = rate.mul(balance).div(10 ** 8)
+        await mockMarketOracle.storeValidity(true)
+        await mockMarketOracle.storeData(rate)
+
+        const currentBalance = await mockCollateralToken.balanceOf(
+          uFragments.address,
+        )
+        await mockCollateralToken.burn(uFragments.address, currentBalance)
+        await mockCollateralToken.mint(uFragments.address, balance)
+
+        const r = uFragments.rebase()
+        await expect(r)
+          .to.emit(uFragments, 'LogRebase')
+          .withArgs(expectedSupply)
+      }
+    })
   })
 })
 
 describe('UFragments:Rebase:Expansion', async () => {
   // Rebase +5M (10%), with starting balances A:750 and B:250.
   let A: Signer, B: Signer, policy: Signer
-  const rebaseAmt = INITIAL_SUPPLY.div(10)
+  // 10% increase in price = 10% rebase
+  const newExchangeRate = INITIAL_EXCHANGE_RATE.add(
+    INITIAL_EXCHANGE_RATE.div(10),
+  )
+  const rebaseAmt = FIRST_MINT_SUPPLY.div(10)
+  let supply: BigNumber
 
   before('setup UFragments contract', async function () {
     await setupContracts()
     A = accounts[2]
     B = accounts[3]
     policy = accounts[1]
-    await uFragments
-      .connect(deployer)
-      .setMonetaryPolicy(await policy.getAddress())
+    await mintFragments(FIRST_MINT_SUPPLY)
     await uFragments
       .connect(deployer)
       .transfer(await A.getAddress(), toUFrgDenomination('750'))
@@ -162,7 +334,7 @@ describe('UFragments:Rebase:Expansion', async () => {
       .connect(deployer)
       .transfer(await B.getAddress(), toUFrgDenomination('250'))
 
-    expect(await uFragments.totalSupply()).to.eq(INITIAL_SUPPLY)
+    expect(await uFragments.totalSupply()).to.eq(FIRST_MINT_SUPPLY)
     expect(await uFragments.balanceOf(await A.getAddress())).to.eq(
       toUFrgDenomination('750'),
     )
@@ -170,28 +342,29 @@ describe('UFragments:Rebase:Expansion', async () => {
       toUFrgDenomination('250'),
     )
 
-    expect(await uFragments.scaledTotalSupply()).to.eq(TOTAL_GONS)
+    expect(await uFragments.scaledTotalSupply()).to.eq(FIRST_MINT_SUPPLY)
     expect(await uFragments.scaledBalanceOf(await A.getAddress())).to.eq(
-      '1736881338559742931353564775130318617799049769984608460591863250000000000',
+      toUFrgDenomination('750'),
     )
     expect(await uFragments.scaledBalanceOf(await B.getAddress())).to.eq(
-      '578960446186580977117854925043439539266349923328202820197287750000000000',
+      toUFrgDenomination('250'),
     )
+    supply = await uFragments.totalSupply()
   })
 
   it('should emit Rebase', async function () {
-    const supply = await uFragments.totalSupply()
-    await expect(uFragments.connect(policy).rebase(supply.add(rebaseAmt)))
+    await mockMarketOracle.storeData(newExchangeRate)
+    await expect(uFragments.connect(policy).rebase())
       .to.emit(uFragments, 'LogRebase')
-      .withArgs(initialSupply.add(rebaseAmt))
+      .withArgs(supply.add(rebaseAmt))
   })
 
   it('should increase the totalSupply', async function () {
-    expect(await uFragments.totalSupply()).to.eq(initialSupply.add(rebaseAmt))
+    expect(await uFragments.totalSupply()).to.eq(supply.add(rebaseAmt))
   })
 
   it('should NOT CHANGE the scaledTotalSupply', async function () {
-    expect(await uFragments.scaledTotalSupply()).to.eq(TOTAL_GONS)
+    expect(await uFragments.scaledTotalSupply()).to.eq(supply)
   })
 
   it('should increase individual balances', async function () {
@@ -205,19 +378,17 @@ describe('UFragments:Rebase:Expansion', async () => {
 
   it('should NOT CHANGE the individual scaled balances', async function () {
     expect(await uFragments.scaledBalanceOf(await A.getAddress())).to.eq(
-      '1736881338559742931353564775130318617799049769984608460591863250000000000',
+      toUFrgDenomination('750'),
     )
     expect(await uFragments.scaledBalanceOf(await B.getAddress())).to.eq(
-      '578960446186580977117854925043439539266349923328202820197287750000000000',
+      toUFrgDenomination('250'),
     )
   })
 
   it('should return the new supply', async function () {
-    const supply = await uFragments.totalSupply()
-    const returnVal = await uFragments
-      .connect(policy)
-      .callStatic.rebase(supply.add(rebaseAmt))
-    await uFragments.connect(policy).rebase(supply.add(rebaseAmt))
+    await mockMarketOracle.storeData(newExchangeRate)
+    const returnVal = await uFragments.connect(policy).callStatic.rebase()
+    await uFragments.connect(policy).rebase()
     expect(await uFragments.totalSupply()).to.eq(returnVal)
   })
 })
@@ -225,25 +396,23 @@ describe('UFragments:Rebase:Expansion', async () => {
 describe('UFragments:Rebase:Expansion', async function () {
   let policy: Signer
   const MAX_SUPPLY = ethers.BigNumber.from(2).pow(128).sub(1)
+  const TOO_HIGH_EXCHANGE_RATE = ethers.BigNumber.from(10)
+    .pow(8)
+    .mul(1000000000000)
 
   describe('when totalSupply is less than MAX_SUPPLY and expands beyond', function () {
     before('setup UFragments contract', async function () {
       await setupContracts()
       policy = accounts[1]
-      await uFragments
-        .connect(deployer)
-        .setMonetaryPolicy(await policy.getAddress())
+      await mintFragments(FIRST_MINT_SUPPLY)
+      await mockMarketOracle.storeData(TOO_HIGH_EXCHANGE_RATE)
       const totalSupply = await uFragments.totalSupply.call()
-      await uFragments
-        .connect(policy)
-        .rebase(MAX_SUPPLY.sub(toUFrgDenomination('1')))
+      await uFragments.connect(policy).rebase()
     })
 
     it('should emit Rebase', async function () {
-      const supply = await uFragments.totalSupply()
-      await expect(
-        uFragments.connect(policy).rebase(supply.add(toUFrgDenomination('2'))),
-      )
+      await mockMarketOracle.storeData(TOO_HIGH_EXCHANGE_RATE.mul(50))
+      await expect(uFragments.connect(policy).rebase())
         .to.emit(uFragments, 'LogRebase')
         .withArgs(MAX_SUPPLY)
     })
@@ -259,10 +428,9 @@ describe('UFragments:Rebase:Expansion', async function () {
     })
 
     it('should emit Rebase', async function () {
+      await mockMarketOracle.storeData(TOO_HIGH_EXCHANGE_RATE.mul(50000))
       const supply = await uFragments.totalSupply()
-      await expect(
-        uFragments.connect(policy).rebase(supply.add(toUFrgDenomination('2'))),
-      )
+      await expect(uFragments.connect(policy).rebase())
         .to.emit(uFragments, 'LogRebase')
         .withArgs(MAX_SUPPLY)
     })
@@ -282,9 +450,7 @@ describe('UFragments:Rebase:NoChange', function () {
     A = accounts[2]
     B = accounts[3]
     policy = accounts[1]
-    await uFragments
-      .connect(deployer)
-      .setMonetaryPolicy(await policy.getAddress())
+    await mintFragments(FIRST_MINT_SUPPLY)
     await uFragments
       .connect(deployer)
       .transfer(await A.getAddress(), toUFrgDenomination('750'))
@@ -292,7 +458,7 @@ describe('UFragments:Rebase:NoChange', function () {
       .connect(deployer)
       .transfer(await B.getAddress(), toUFrgDenomination('250'))
 
-    expect(await uFragments.totalSupply()).to.eq(INITIAL_SUPPLY)
+    expect(await uFragments.totalSupply()).to.eq(FIRST_MINT_SUPPLY)
     expect(await uFragments.balanceOf(await A.getAddress())).to.eq(
       toUFrgDenomination('750'),
     )
@@ -300,28 +466,28 @@ describe('UFragments:Rebase:NoChange', function () {
       toUFrgDenomination('250'),
     )
 
-    expect(await uFragments.scaledTotalSupply()).to.eq(TOTAL_GONS)
+    expect(await uFragments.scaledTotalSupply()).to.eq(FIRST_MINT_SUPPLY)
     expect(await uFragments.scaledBalanceOf(await A.getAddress())).to.eq(
-      '1736881338559742931353564775130318617799049769984608460591863250000000000',
+      toUFrgDenomination('750'),
     )
     expect(await uFragments.scaledBalanceOf(await B.getAddress())).to.eq(
-      '578960446186580977117854925043439539266349923328202820197287750000000000',
+      toUFrgDenomination('250'),
     )
   })
 
   it('should emit Rebase', async function () {
     const supply = await uFragments.totalSupply()
-    await expect(uFragments.connect(policy).rebase(supply))
+    await expect(uFragments.connect(policy).rebase())
       .to.emit(uFragments, 'LogRebase')
-      .withArgs(initialSupply)
+      .withArgs(supply)
   })
 
   it('should NOT CHANGE the totalSupply', async function () {
-    expect(await uFragments.totalSupply()).to.eq(initialSupply)
+    expect(await uFragments.totalSupply()).to.eq(FIRST_MINT_SUPPLY)
   })
 
   it('should NOT CHANGE the scaledTotalSupply', async function () {
-    expect(await uFragments.scaledTotalSupply()).to.eq(TOTAL_GONS)
+    expect(await uFragments.scaledTotalSupply()).to.eq(FIRST_MINT_SUPPLY)
   })
 
   it('should NOT CHANGE individual balances', async function () {
@@ -335,10 +501,10 @@ describe('UFragments:Rebase:NoChange', function () {
 
   it('should NOT CHANGE the individual scaled balances', async function () {
     expect(await uFragments.scaledBalanceOf(await A.getAddress())).to.eq(
-      '1736881338559742931353564775130318617799049769984608460591863250000000000',
+      toUFrgDenomination('750'),
     )
     expect(await uFragments.scaledBalanceOf(await B.getAddress())).to.eq(
-      '578960446186580977117854925043439539266349923328202820197287750000000000',
+      toUFrgDenomination('250'),
     )
   })
 })
@@ -346,16 +512,17 @@ describe('UFragments:Rebase:NoChange', function () {
 describe('UFragments:Rebase:Contraction', function () {
   // Rebase -5M (-10%), with starting balances A:750 and B:250.
   let A: Signer, B: Signer, policy: Signer
-  const rebaseAmt = INITIAL_SUPPLY.div(10)
+  const rebaseAmt = FIRST_MINT_SUPPLY.div(10)
+  const newExchangeRate = INITIAL_EXCHANGE_RATE.sub(
+    INITIAL_EXCHANGE_RATE.div(10),
+  )
 
   before('setup UFragments contract', async function () {
     await setupContracts()
     A = accounts[2]
     B = accounts[3]
     policy = accounts[1]
-    await uFragments
-      .connect(deployer)
-      .setMonetaryPolicy(await policy.getAddress())
+    await mintFragments(FIRST_MINT_SUPPLY)
     await uFragments
       .connect(deployer)
       .transfer(await A.getAddress(), toUFrgDenomination('750'))
@@ -363,7 +530,7 @@ describe('UFragments:Rebase:Contraction', function () {
       .connect(deployer)
       .transfer(await B.getAddress(), toUFrgDenomination('250'))
 
-    expect(await uFragments.totalSupply()).to.eq(INITIAL_SUPPLY)
+    expect(await uFragments.totalSupply()).to.eq(FIRST_MINT_SUPPLY)
     expect(await uFragments.balanceOf(await A.getAddress())).to.eq(
       toUFrgDenomination('750'),
     )
@@ -371,28 +538,31 @@ describe('UFragments:Rebase:Contraction', function () {
       toUFrgDenomination('250'),
     )
 
-    expect(await uFragments.scaledTotalSupply()).to.eq(TOTAL_GONS)
+    expect(await uFragments.scaledTotalSupply()).to.eq(FIRST_MINT_SUPPLY)
     expect(await uFragments.scaledBalanceOf(await A.getAddress())).to.eq(
-      '1736881338559742931353564775130318617799049769984608460591863250000000000',
+      toUFrgDenomination('750'),
     )
     expect(await uFragments.scaledBalanceOf(await B.getAddress())).to.eq(
-      '578960446186580977117854925043439539266349923328202820197287750000000000',
+      toUFrgDenomination('250'),
     )
   })
 
   it('should emit Rebase', async function () {
+    await mockMarketOracle.storeData(newExchangeRate)
     const supply = await uFragments.totalSupply()
-    await expect(uFragments.connect(policy).rebase(supply.sub(rebaseAmt)))
+    await expect(uFragments.connect(policy).rebase())
       .to.emit(uFragments, 'LogRebase')
-      .withArgs(initialSupply.sub(rebaseAmt))
+      .withArgs(supply.sub(rebaseAmt))
   })
 
   it('should decrease the totalSupply', async function () {
-    expect(await uFragments.totalSupply()).to.eq(initialSupply.sub(rebaseAmt))
+    expect(await uFragments.totalSupply()).to.eq(
+      FIRST_MINT_SUPPLY.sub(rebaseAmt),
+    )
   })
 
   it('should NOT. CHANGE the scaledTotalSupply', async function () {
-    expect(await uFragments.scaledTotalSupply()).to.eq(TOTAL_GONS)
+    expect(await uFragments.scaledTotalSupply()).to.eq(FIRST_MINT_SUPPLY)
   })
 
   it('should decrease individual balances', async function () {
@@ -406,10 +576,10 @@ describe('UFragments:Rebase:Contraction', function () {
 
   it('should NOT CHANGE the individual scaled balances', async function () {
     expect(await uFragments.scaledBalanceOf(await A.getAddress())).to.eq(
-      '1736881338559742931353564775130318617799049769984608460591863250000000000',
+      toUFrgDenomination('750'),
     )
     expect(await uFragments.scaledBalanceOf(await B.getAddress())).to.eq(
-      '578960446186580977117854925043439539266349923328202820197287750000000000',
+      toUFrgDenomination('250'),
     )
   })
 })
@@ -422,6 +592,7 @@ describe('UFragments:Transfer', function () {
     A = accounts[2]
     B = accounts[3]
     C = accounts[4]
+    await mintFragments(FIRST_MINT_SUPPLY)
   })
 
   describe('deployer transfers 12 to A', function () {

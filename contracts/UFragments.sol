@@ -3,6 +3,9 @@ pragma solidity 0.7.6;
 import "./_external/SafeMath.sol";
 import "./_external/Ownable.sol";
 import "./_external/ERC20Detailed.sol";
+import "./_external/IERC20.sol";
+import "./_external/TransferHelper.sol";
+import "./interfaces/IOracle.sol";
 
 import "./lib/SafeMathInt.sol";
 
@@ -21,8 +24,8 @@ contract UFragments is ERC20Detailed, Ownable {
     // Anytime there is division, there is a risk of numerical instability from rounding errors. In
     // order to minimize this risk, we adhere to the following guidelines:
     // 1) The conversion rate adopted is the number of gons that equals 1 fragment.
-    //    The inverse rate must not be used--TOTAL_GONS is always the numerator and _totalSupply is
-    //    always the denominator. (i.e. If you want to convert gons to fragments instead of
+    //    The inverse rate must not be used--totalCollateral is always the numerator and _totalSupply
+    //    is always the denominator. (i.e. If you want to convert gons to fragments instead of
     //    multiplying by the inverse rate, you should divide by the normal rate)
     // 2) Gon balances converted into Fragments are always rounded down (truncated).
     //
@@ -38,18 +41,7 @@ contract UFragments is ERC20Detailed, Ownable {
     using SafeMathInt for int256;
 
     event LogRebase(uint256 totalSupply);
-    event LogMonetaryPolicyUpdated(address monetaryPolicy);
-
-    // Used for authentication
-    address public monetaryPolicy;
-
-    modifier onlyMonetaryPolicy() {
-        require(msg.sender == monetaryPolicy);
-        _;
-    }
-
-    bool private rebasePausedDeprecated;
-    bool private tokenPausedDeprecated;
+    event LogMarketOracleUpdated(address marketOracle);
 
     modifier validRecipient(address to) {
         require(to != address(0x0));
@@ -57,20 +49,25 @@ contract UFragments is ERC20Detailed, Ownable {
         _;
     }
 
-    uint256 private constant DECIMALS = 9;
+    uint256 private constant DECIMALS = 18;
     uint256 private constant MAX_UINT256 = type(uint256).max;
-    uint256 private constant INITIAL_FRAGMENTS_SUPPLY = 50 * 10**6 * 10**DECIMALS;
+    uint256 private constant EXCHANGE_RATE_DECIMALS = 8;
 
-    // TOTAL_GONS is a multiple of INITIAL_FRAGMENTS_SUPPLY so that _gonsPerFragment is an integer.
-    // Use the highest value that fits in a uint256 for max granularity.
-    uint256 private constant TOTAL_GONS = MAX_UINT256 - (MAX_UINT256 % INITIAL_FRAGMENTS_SUPPLY);
-
-    // MAX_SUPPLY = maximum integer < (sqrt(4*TOTAL_GONS + 1) - 1) / 2
+    // MAX_SUPPLY = maximum integer < (sqrt(4*totalCollateral + 1) - 1) / 2
     uint256 private constant MAX_SUPPLY = type(uint128).max; // (2^128) - 1
 
-    uint256 private _totalSupply;
-    uint256 private _gonsPerFragment;
-    mapping(address => uint256) private _gonBalances;
+    uint256 public override totalSupply;
+    uint256 public totalCollateral;
+    // exchange rate of the collateral in USD, as a 8 decimal fixed point number
+    uint256 public exchangeRate;
+
+    IERC20 public collateralToken;
+    uint256 public collateralTokenDecimals;
+    // Market oracle provides the token/USD exchange rate as an 8 decimal fixed point number.
+    // (eg) An oracle value of 1.5e8 it would mean 1 unit of collateral is trading for $1.50.
+    IOracle public marketOracle;
+
+    mapping(address => uint256) private _collateralBalances;
 
     // This is denominated in Fragments, because the gons-fragments conversion might change before
     // it's fully paid.
@@ -92,67 +89,75 @@ contract UFragments is ERC20Detailed, Ownable {
     mapping(address => uint256) private _nonces;
 
     /**
-     * @param monetaryPolicy_ The address of the monetary policy contract to use for authentication.
+     * @notice Sets the reference to the market oracle.
+     * @param _marketOracle The address of the market oracle contract.
      */
-    function setMonetaryPolicy(address monetaryPolicy_) external onlyOwner {
-        monetaryPolicy = monetaryPolicy_;
-        emit LogMonetaryPolicyUpdated(monetaryPolicy_);
+    function setMarketOracle(IOracle _marketOracle) external onlyOwner {
+        marketOracle = _marketOracle;
+        emit LogMarketOracleUpdated(address(_marketOracle));
     }
 
     /**
      * @dev Notifies Fragments contract about a new rebase cycle.
-     * @param newSupply The requested new total number of fragment tokens.
      * @return The total number of fragments after the supply adjustment.
      */
-    function rebase(uint256 newSupply) external onlyMonetaryPolicy returns (uint256) {
-        uint256 previousSupply = _totalSupply;
+    function rebase() public returns (uint256) {
+        uint256 _exchangeRate;
+        bool rateValid;
+        (_exchangeRate, rateValid) = marketOracle.getData();
+        require(rateValid, "Invalid rate");
 
-        if (newSupply == previousSupply) {
-            emit LogRebase(previousSupply);
-            return previousSupply;
-        }
+        exchangeRate = _exchangeRate;
+
+        // TODO: normalize to our decimal points system, or do that somewhere else
+        uint256 collateralBalance = collateralToken.balanceOf(address(this));
+        // TODO: maybe check if collateral balance changed since last rebase i.e. without mint/burn
+        // and mint new tokens accordingly so we maintain invariant
+        uint256 newSupply = _collateralAmountToFragmentAmount(collateralBalance);
 
         if (newSupply > MAX_SUPPLY) {
             newSupply = MAX_SUPPLY;
         }
 
-        _totalSupply = newSupply;
-        _gonsPerFragment = TOTAL_GONS.div(newSupply);
+        totalSupply = newSupply;
+        totalCollateral = collateralBalance;
 
-        // From this point forward, _gonsPerFragment is taken as the source of truth.
-        // We recalculate a new _totalSupply to be in agreement with the _gonsPerFragment
+        // From this point forward, exchangeRate is taken as the source of truth.
+        // We recalculate a new _totalSupply to be in agreement with the exchangeRate
         // conversion rate.
         // This means our applied newSupply can deviate from the requested newSupply,
-        // but this deviation is guaranteed to be < (_totalSupply^2)/(TOTAL_GONS - _totalSupply).
+        // but this deviation is guaranteed to be < (_totalSupply^2)/(totalCollateral - _totalSupply).
         //
         // In the case of _totalSupply <= MAX_UINT128 (our current supply cap), this
         // deviation is guaranteed to be < 1, so we can omit this step. If the supply cap is
         // ever increased, it must be re-included.
-        // _totalSupply = TOTAL_GONS.div(_gonsPerFragment)
+        // _totalSupply = totalCollateral.div(exchangeRate)
 
         emit LogRebase(newSupply);
         return newSupply;
     }
 
-    function initialize(address owner_) public override initializer {
+    function initialize(
+        address _owner,
+        IERC20 _collateralToken,
+        uint256 _collateralTokenDecimals
+    ) public initializer {
+        require(
+            _collateralTokenDecimals <= DECIMALS,
+            "Invalid collateral token: too many decimals"
+        );
+
         ERC20Detailed.initialize("Ampleforth", "AMPL", uint8(DECIMALS));
-        Ownable.initialize(owner_);
+        Ownable.initialize(_owner);
 
-        rebasePausedDeprecated = false;
-        tokenPausedDeprecated = false;
+        totalCollateral = 0;
+        totalSupply = 0;
+        // start with exchange rate of 1:1 to avoid div/0
+        exchangeRate = 10**EXCHANGE_RATE_DECIMALS;
+        collateralToken = _collateralToken;
+        collateralTokenDecimals = _collateralTokenDecimals;
 
-        _totalSupply = INITIAL_FRAGMENTS_SUPPLY;
-        _gonBalances[owner_] = TOTAL_GONS;
-        _gonsPerFragment = TOTAL_GONS.div(_totalSupply);
-
-        emit Transfer(address(0x0), owner_, _totalSupply);
-    }
-
-    /**
-     * @return The total number of fragments.
-     */
-    function totalSupply() external view override returns (uint256) {
-        return _totalSupply;
+        emit Transfer(address(0x0), _owner, 0);
     }
 
     /**
@@ -160,7 +165,7 @@ contract UFragments is ERC20Detailed, Ownable {
      * @return The balance of the specified address.
      */
     function balanceOf(address who) external view override returns (uint256) {
-        return _gonBalances[who].div(_gonsPerFragment);
+        return _collateralBalances[who].mul(exchangeRate).div(10**EXCHANGE_RATE_DECIMALS);
     }
 
     /**
@@ -168,14 +173,14 @@ contract UFragments is ERC20Detailed, Ownable {
      * @return The gon balance of the specified address.
      */
     function scaledBalanceOf(address who) external view returns (uint256) {
-        return _gonBalances[who];
+        return _collateralBalances[who];
     }
 
     /**
      * @return the total number of gons.
      */
-    function scaledTotalSupply() external pure returns (uint256) {
-        return TOTAL_GONS;
+    function scaledTotalSupply() external view returns (uint256) {
+        return totalCollateral;
     }
 
     /**
@@ -219,10 +224,10 @@ contract UFragments is ERC20Detailed, Ownable {
         validRecipient(to)
         returns (bool)
     {
-        uint256 gonValue = value.mul(_gonsPerFragment);
+        uint256 collateralValue = value.mul(10**EXCHANGE_RATE_DECIMALS).div(exchangeRate);
 
-        _gonBalances[msg.sender] = _gonBalances[msg.sender].sub(gonValue);
-        _gonBalances[to] = _gonBalances[to].add(gonValue);
+        _collateralBalances[msg.sender] = _collateralBalances[msg.sender].sub(collateralValue);
+        _collateralBalances[to] = _collateralBalances[to].add(collateralValue);
 
         emit Transfer(msg.sender, to, value);
         return true;
@@ -234,11 +239,11 @@ contract UFragments is ERC20Detailed, Ownable {
      * @return True on success, false otherwise.
      */
     function transferAll(address to) external validRecipient(to) returns (bool) {
-        uint256 gonValue = _gonBalances[msg.sender];
-        uint256 value = gonValue.div(_gonsPerFragment);
+        uint256 collateralValue = _collateralBalances[msg.sender];
+        uint256 value = collateralValue.mul(exchangeRate).div(10**EXCHANGE_RATE_DECIMALS);
 
-        delete _gonBalances[msg.sender];
-        _gonBalances[to] = _gonBalances[to].add(gonValue);
+        delete _collateralBalances[msg.sender];
+        _collateralBalances[to] = _collateralBalances[to].add(collateralValue);
 
         emit Transfer(msg.sender, to, value);
         return true;
@@ -246,12 +251,12 @@ contract UFragments is ERC20Detailed, Ownable {
 
     /**
      * @dev Function to check the amount of tokens that an owner has allowed to a spender.
-     * @param owner_ The address which owns the funds.
+     * @param _owner The address which owns the funds.
      * @param spender The address which will spend the funds.
      * @return The number of tokens still available for the spender.
      */
-    function allowance(address owner_, address spender) external view override returns (uint256) {
-        return _allowedFragments[owner_][spender];
+    function allowance(address _owner, address spender) external view override returns (uint256) {
+        return _allowedFragments[_owner][spender];
     }
 
     /**
@@ -267,9 +272,9 @@ contract UFragments is ERC20Detailed, Ownable {
     ) external override validRecipient(to) returns (bool) {
         _allowedFragments[from][msg.sender] = _allowedFragments[from][msg.sender].sub(value);
 
-        uint256 gonValue = value.mul(_gonsPerFragment);
-        _gonBalances[from] = _gonBalances[from].sub(gonValue);
-        _gonBalances[to] = _gonBalances[to].add(gonValue);
+        uint256 collateralValue = value.mul(10**EXCHANGE_RATE_DECIMALS).div(exchangeRate);
+        _collateralBalances[from] = _collateralBalances[from].sub(collateralValue);
+        _collateralBalances[to] = _collateralBalances[to].add(collateralValue);
 
         emit Transfer(from, to, value);
         return true;
@@ -281,13 +286,13 @@ contract UFragments is ERC20Detailed, Ownable {
      * @param to The address you want to transfer to.
      */
     function transferAllFrom(address from, address to) external validRecipient(to) returns (bool) {
-        uint256 gonValue = _gonBalances[from];
-        uint256 value = gonValue.div(_gonsPerFragment);
+        uint256 collateralValue = _collateralBalances[from];
+        uint256 value = collateralValue.mul(exchangeRate).div(10**EXCHANGE_RATE_DECIMALS);
 
         _allowedFragments[from][msg.sender] = _allowedFragments[from][msg.sender].sub(value);
 
-        delete _gonBalances[from];
-        _gonBalances[to] = _gonBalances[to].add(gonValue);
+        delete _collateralBalances[from];
+        _collateralBalances[to] = _collateralBalances[to].add(collateralValue);
 
         emit Transfer(from, to, value);
         return true;
@@ -376,5 +381,75 @@ contract UFragments is ERC20Detailed, Ownable {
 
         _allowedFragments[owner][spender] = value;
         emit Approval(owner, spender, value);
+    }
+
+    /** @dev Wraps `collateralAmount` collateral tokens and creates
+     * appropriate number of wrapper tokens, assigning them to `to`, increasing
+     * the total supply.
+     *
+     * Emits a {Transfer} event with `from` set to the zero address.
+     *
+     * Requirements:
+     *
+     * - `to` cannot be the zero address.
+     * - `to` cannot be the address of this contract.
+     * - `collateralAmount` collateral tokens must be pre-approved to this contract
+     */
+    function mint(address to, uint256 collateralAmount) external validRecipient(to) {
+        // rebase();
+        TransferHelper.safeTransferFrom(
+            address(collateralToken),
+            msg.sender,
+            address(this),
+            collateralAmount
+        );
+
+        uint256 fragmentAmount = _collateralAmountToFragmentAmount(collateralAmount);
+        totalCollateral = totalCollateral.add(collateralAmount);
+        _collateralBalances[to] = _collateralBalances[to].add(collateralAmount);
+        totalSupply = totalSupply.add(fragmentAmount);
+        emit Transfer(address(0), to, fragmentAmount);
+    }
+
+    /** @dev Wraps `collateralAmount` collateral tokens and creates
+     * appropriate number of wrapper tokens, assigning them to `to`, increasing
+     * the total supply.
+     *
+     * Emits a {Transfer} event with `from` set to the zero address.
+     *
+     * Requirements:
+     *
+     * - `to` cannot be the zero address.
+     * - `to` cannot be the address of this contract.
+     * - `collateralAmount` collateral tokens must be pre-approved to this contract
+     */
+    function burn(address from, uint256 fragmentAmount) external validRecipient(from) {
+        uint256 collateralAmount = fragmentAmount.mul(10**EXCHANGE_RATE_DECIMALS).div(exchangeRate);
+
+        uint256 fragmentAmount = _collateralAmountToFragmentAmount(collateralAmount);
+        totalCollateral = totalCollateral.sub(collateralAmount);
+        _collateralBalances[from] = _collateralBalances[from].sub(collateralAmount);
+        totalSupply = totalSupply.sub(fragmentAmount);
+        // rebase();
+        emit Transfer(from, address(0), fragmentAmount);
+    }
+
+    /**
+     * @dev Transforms an amount of collateral tokens to an amount of fragments
+     * This takes into account both the decimal precision and the exchange rate
+     */
+    function _collateralAmountToFragmentAmount(uint256 collateralAmount)
+        private
+        view
+        returns (uint256 fragmentAmount)
+    {
+        uint256 precisionDifference = DECIMALS.sub(collateralTokenDecimals);
+        // A note on overflow concerns with unsafe exponentiation:
+        // The `precisionDifference` value is limited to 17 (i.e. underlying token has 1 decimal place of precision)
+        // So 10^17 is the maximum value generated by the exponentiation, which does not overflow.
+        return
+            collateralAmount.mul(exchangeRate).div(10**EXCHANGE_RATE_DECIMALS).mul(
+                10**precisionDifference
+            );
     }
 }
