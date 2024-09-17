@@ -62,9 +62,6 @@ contract ButtonToken is IButtonToken, Initializable, OwnableUpgradeable {
     //--------------------------------------------------------------------------
     // Constants
 
-    /// @dev The price has a 8 decimal point precision.
-    uint256 public constant PRICE_DECIMALS = 8;
-
     /// @dev Math constants.
     uint256 private constant MAX_UINT256 = type(uint256).max;
 
@@ -78,13 +75,6 @@ contract ButtonToken is IButtonToken, Initializable, OwnableUpgradeable {
 
     /// @dev Number of BITS per unit of deposit.
     uint256 private constant BITS_PER_UNDERLYING = TOTAL_BITS / MAX_UNDERLYING;
-
-    /// @dev Number of BITS per unit of deposit * (1 USD).
-    uint256 private constant PRICE_BITS = BITS_PER_UNDERLYING * (10**PRICE_DECIMALS);
-
-    /// @dev TRUE_MAX_PRICE = maximum integer < (sqrt(4*PRICE_BITS + 1) - 1) / 2
-    ///      Setting MAX_PRICE to the closest two power which is just under TRUE_MAX_PRICE.
-    uint256 public constant MAX_PRICE = (2**96 - 1); // (2^96) - 1
 
     //--------------------------------------------------------------------------
     // Attributes
@@ -106,6 +96,13 @@ contract ButtonToken is IButtonToken, Initializable, OwnableUpgradeable {
 
     /// @inheritdoc IERC20Metadata
     string public override symbol;
+
+    /// @dev Number of BITS per unit of deposit * (1 USD).
+    uint256 private priceBits;
+
+    /// @dev trueMaxPrice = maximum integer < (sqrt(4*priceBits + 1) - 1) / 2
+    ///      maxPrice is the closest power of two which is just under trueMaxPrice.
+    uint256 private maxPrice;
 
     /// @dev internal balance, bits issued per account
     mapping(address => uint256) private _accountBits;
@@ -174,6 +171,10 @@ contract ButtonToken is IButtonToken, Initializable, OwnableUpgradeable {
         oracle = oracle_;
         (price, valid) = _queryPrice();
         require(valid, "ButtonToken: unable to fetch data from oracle");
+
+        uint256 priceDecimals = IOracle(oracle).priceDecimals();
+        priceBits = BITS_PER_UNDERLYING * (10 ** priceDecimals);
+        maxPrice = maxPriceFromPriceDecimals(priceDecimals);
 
         emit OracleUpdated(oracle);
         _rebase(price);
@@ -259,25 +260,18 @@ contract ButtonToken is IButtonToken, Initializable, OwnableUpgradeable {
     // ERC-20 write methods
 
     /// @inheritdoc IERC20
-    function transfer(address to, uint256 amount)
-        external
-        override
-        validRecipient(to)
-        onAfterRebase
-        returns (bool)
-    {
+    function transfer(
+        address to,
+        uint256 amount
+    ) external override validRecipient(to) onAfterRebase returns (bool) {
         _transfer(_msgSender(), to, _amountToBits(amount, lastPrice), amount);
         return true;
     }
 
     /// @inheritdoc IRebasingERC20
-    function transferAll(address to)
-        external
-        override
-        validRecipient(to)
-        onAfterRebase
-        returns (bool)
-    {
+    function transferAll(
+        address to
+    ) external override validRecipient(to) onAfterRebase returns (bool) {
         uint256 bits = _accountBits[_msgSender()];
         _transfer(_msgSender(), to, bits, _bitsToAmount(bits, lastPrice));
         return true;
@@ -299,13 +293,10 @@ contract ButtonToken is IButtonToken, Initializable, OwnableUpgradeable {
     }
 
     /// @inheritdoc IRebasingERC20
-    function transferAllFrom(address from, address to)
-        external
-        override
-        validRecipient(to)
-        onAfterRebase
-        returns (bool)
-    {
+    function transferAllFrom(
+        address from,
+        address to
+    ) external override validRecipient(to) onAfterRebase returns (bool) {
         uint256 bits = _accountBits[from];
         uint256 amount = _bitsToAmount(bits, lastPrice);
 
@@ -416,12 +407,10 @@ contract ButtonToken is IButtonToken, Initializable, OwnableUpgradeable {
     }
 
     /// @inheritdoc IButtonWrapper
-    function depositFor(address to, uint256 uAmount)
-        external
-        override
-        onAfterRebase
-        returns (uint256)
-    {
+    function depositFor(
+        address to,
+        uint256 uAmount
+    ) external override onAfterRebase returns (uint256) {
         uint256 bits = _uAmountToBits(uAmount);
         uint256 amount = _bitsToAmount(bits, lastPrice);
         _deposit(_msgSender(), to, uAmount, amount, bits);
@@ -437,12 +426,10 @@ contract ButtonToken is IButtonToken, Initializable, OwnableUpgradeable {
     }
 
     /// @inheritdoc IButtonWrapper
-    function withdrawTo(address to, uint256 uAmount)
-        external
-        override
-        onAfterRebase
-        returns (uint256)
-    {
+    function withdrawTo(
+        address to,
+        uint256 uAmount
+    ) external override onAfterRebase returns (uint256) {
         uint256 bits = _uAmountToBits(uAmount);
         uint256 amount = _bitsToAmount(bits, lastPrice);
         _withdraw(_msgSender(), to, uAmount, amount, bits);
@@ -479,6 +466,7 @@ contract ButtonToken is IButtonToken, Initializable, OwnableUpgradeable {
         uint256 amount,
         uint256 bits
     ) private {
+        require(uAmount > 0, "ButtonToken: No tokens deposited");
         require(amount > 0, "ButtonToken: too few button tokens to mint");
 
         IERC20(underlying).safeTransferFrom(from, address(this), uAmount);
@@ -504,12 +492,7 @@ contract ButtonToken is IButtonToken, Initializable, OwnableUpgradeable {
 
     /// @dev Internal method to commit transfer state.
     ///      NOTE: Expects bits/amounts to be pre-calculated.
-    function _transfer(
-        address from,
-        address to,
-        uint256 bits,
-        uint256 amount
-    ) private {
+    function _transfer(address from, address to, uint256 bits, uint256 amount) private {
         _accountBits[from] -= bits;
         _accountBits[to] += bits;
 
@@ -522,8 +505,9 @@ contract ButtonToken is IButtonToken, Initializable, OwnableUpgradeable {
 
     /// @dev Updates the `lastPrice` and recomputes the internal scalar.
     function _rebase(uint256 price) private {
-        if (price > MAX_PRICE) {
-            price = MAX_PRICE;
+        uint256 _maxPrice = maxPrice;
+        if (price > _maxPrice) {
+            price = _maxPrice;
         }
 
         lastPrice = price;
@@ -552,7 +536,7 @@ contract ButtonToken is IButtonToken, Initializable, OwnableUpgradeable {
     }
 
     /// @dev Convert button token amount to bits.
-    function _amountToBits(uint256 amount, uint256 price) private pure returns (uint256) {
+    function _amountToBits(uint256 amount, uint256 price) private view returns (uint256) {
         return amount * _bitsPerToken(price);
     }
 
@@ -562,7 +546,7 @@ contract ButtonToken is IButtonToken, Initializable, OwnableUpgradeable {
     }
 
     /// @dev Convert bits to button token amount.
-    function _bitsToAmount(uint256 bits, uint256 price) private pure returns (uint256) {
+    function _bitsToAmount(uint256 bits, uint256 price) private view returns (uint256) {
         return bits / _bitsPerToken(price);
     }
 
@@ -572,7 +556,69 @@ contract ButtonToken is IButtonToken, Initializable, OwnableUpgradeable {
     }
 
     /// @dev Internal scalar to convert bits to button tokens.
-    function _bitsPerToken(uint256 price) private pure returns (uint256) {
-        return PRICE_BITS / price;
+    function _bitsPerToken(uint256 price) private view returns (uint256) {
+        return priceBits / price;
+    }
+
+    /// @dev Derives max-price based on price-decimals
+    function maxPriceFromPriceDecimals(uint256 priceDecimals) private pure returns (uint256) {
+        require(priceDecimals <= 18, "ButtonToken: Price Decimals must be under 18");
+        // Given that 18,8,6 are the most common price decimals, we optimize for those cases
+        if (priceDecimals == 18) {
+            return 2 ** 113 - 1;
+        }
+        if (priceDecimals == 8) {
+            return 2 ** 96 - 1;
+        }
+        if (priceDecimals == 6) {
+            return 2 ** 93 - 1;
+        }
+        if (priceDecimals == 0) {
+            return 2 ** 83 - 1;
+        }
+        if (priceDecimals == 1) {
+            return 2 ** 84 - 1;
+        }
+        if (priceDecimals == 2) {
+            return 2 ** 86 - 1;
+        }
+        if (priceDecimals == 3) {
+            return 2 ** 88 - 1;
+        }
+        if (priceDecimals == 4) {
+            return 2 ** 89 - 1;
+        }
+        if (priceDecimals == 5) {
+            return 2 ** 91 - 1;
+        }
+        if (priceDecimals == 7) {
+            return 2 ** 94 - 1;
+        }
+        if (priceDecimals == 9) {
+            return 2 ** 98 - 1;
+        }
+        if (priceDecimals == 10) {
+            return 2 ** 99 - 1;
+        }
+        if (priceDecimals == 11) {
+            return 2 ** 101 - 1;
+        }
+        if (priceDecimals == 12) {
+            return 2 ** 103 - 1;
+        }
+        if (priceDecimals == 13) {
+            return 2 ** 104 - 1;
+        }
+        if (priceDecimals == 14) {
+            return 2 ** 106 - 1;
+        }
+        if (priceDecimals == 15) {
+            return 2 ** 108 - 1;
+        }
+        if (priceDecimals == 16) {
+            return 2 ** 109 - 1;
+        }
+        // priceDecimals == 17
+        return 2 ** 111 - 1;
     }
 }
